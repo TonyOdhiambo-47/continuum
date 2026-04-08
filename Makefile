@@ -52,6 +52,7 @@ test:
 
 wasm:
 	@command -v $(EMCC) >/dev/null || { echo "emcc not found — install emscripten"; exit 1; }
+	@mkdir -p $(dir $(WASM_OUT))
 	$(EMCC) $(WASM_FLAGS) $(CORE_SRC) -o $(WASM_OUT)
 
 web: wasm

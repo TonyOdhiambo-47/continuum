@@ -1,3 +1,8 @@
+/* Required for clock_gettime / nanosleep on glibc — macOS exposes them
+ * by default but Linux needs the POSIX feature test macro defined before
+ * any system header is included. */
+#define _POSIX_C_SOURCE 200809L
+
 /*
  * Continuum — terminal_main.c
  *
@@ -456,8 +461,10 @@ int main(int argc, char **argv) {
                 int sx = (int)((double)(ev.mx - 1) / (double)term_w * (double)N);
                 /* Each terminal row has 2 vertical pixels — pick the top one. */
                 int sy = (int)((double)((ev.my - 1) * 2) / (double)(draw_rows * 2) * (double)N);
-                if (sx < 1) sx = 1; if (sx > N) sx = N;
-                if (sy < 1) sy = 1; if (sy > N) sy = N;
+                if (sx < 1) sx = 1;
+                if (sx > N) sx = N;
+                if (sy < 1) sy = 1;
+                if (sy > N) sy = N;
 
                 if (ev.pressed) {
                     if (drag_active == 0) {
