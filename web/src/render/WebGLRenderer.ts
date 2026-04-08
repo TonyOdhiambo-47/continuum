@@ -29,6 +29,7 @@ export class WebGLRenderer {
   private uDye:      WebGLUniformLocation;
   private texW = 0;
   private texH = 0;
+  private canFilterFloat = false;
 
   constructor(canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl2", {
@@ -39,9 +40,11 @@ export class WebGLRenderer {
     if (!gl) throw new Error("WebGL2 not supported in this browser");
     this.gl = gl;
 
-    // We need EXT_color_buffer_float on most platforms to upload float
-    // textures even just for sampling — but R32F/RGBA32F are sample-able
-    // without that extension. We sample, never render-to, so we're fine.
+    // RGB32F is sample-able from a fragment shader on all WebGL2
+    // implementations, but LINEAR filtering of float textures requires
+    // OES_texture_float_linear. If the browser doesn't expose it we
+    // silently downgrade to NEAREST so the texture stays complete.
+    this.canFilterFloat = gl.getExtension("OES_texture_float_linear") != null;
 
     this.prog = this.compile(vertSrc, fragSrc);
     this.vao  = gl.createVertexArray()!;
@@ -54,8 +57,9 @@ export class WebGLRenderer {
 
     this.tex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    const filter = this.canFilterFloat ? gl.LINEAR : gl.NEAREST;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   }

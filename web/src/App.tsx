@@ -75,6 +75,7 @@ export function App() {
         bridge.setViscosity(stateRef.current.viscosity);
         setLoadState("ready");
       } catch (e) {
+        if (cancelled) return;
         setError(String(e));
         setLoadState("error");
       }
@@ -182,8 +183,9 @@ export function App() {
   };
   const onPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
     dragRef.current.active = false;
-    (e.target as HTMLCanvasElement).releasePointerCapture(e.pointerId);
+    try { (e.target as HTMLCanvasElement).releasePointerCapture(e.pointerId); } catch { /* noop */ }
   };
+  const onPointerCancel = () => { dragRef.current.active = false; };
 
   /* ---------- keyboard ---------------------------------------------- */
   useEffect(() => {
@@ -227,6 +229,8 @@ export function App() {
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onPointerCancel={onPointerCancel}
+        onLostPointerCapture={onPointerCancel}
         onContextMenu={(e) => e.preventDefault()}
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", touchAction: "none" }}
       />

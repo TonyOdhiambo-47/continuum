@@ -79,6 +79,11 @@ float fluid_get_velocity_mag(FluidSim *sim, int x, int y);
 float fluid_get_vorticity(FluidSim *sim, int x, int y);
 int   fluid_get_obstacle(FluidSim *sim, int x, int y);
 
+/* Bulk copy. Writes the entire (N+2)² dye field into `dst` interleaved
+ * as RGB float triples. `dst` must point to at least (N+2)² * 3 floats.
+ * Used by the WebGL renderer to avoid per-cell JS↔WASM round-trips. */
+void fluid_copy_dye_rgb(FluidSim *sim, float *dst);
+
 #ifdef __cplusplus
 }
 #endif

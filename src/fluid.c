@@ -487,3 +487,16 @@ int fluid_get_obstacle(FluidSim *sim, int x, int y) {
     if (x < 0 || x > N + 1 || y < 0 || y > N + 1) return 0;
     return sim->obstacle[IX(x, y)] ? 1 : 0;
 }
+
+void fluid_copy_dye_rgb(FluidSim *sim, float *dst) {
+    if (!sim || !dst) return;
+    int size = sim->size;
+    const float *r = sim->r;
+    const float *g = sim->g;
+    const float *b = sim->b;
+    for (int i = 0; i < size; i++) {
+        dst[i * 3 + 0] = r[i];
+        dst[i * 3 + 1] = g[i];
+        dst[i * 3 + 2] = b[i];
+    }
+}

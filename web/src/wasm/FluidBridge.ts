@@ -40,16 +40,20 @@ type EmModule = {
   _fluid_get_velocity_mag(sim: number, x: number, y: number): number;
   _fluid_get_vorticity(sim: number, x: number, y: number): number;
   _fluid_get_obstacle(sim: number, x: number, y: number): number;
+  _fluid_copy_dye_rgb(sim: number, dstPtr: number): void;
 };
 
 type EmFactory = (overrides?: Record<string, unknown>) => Promise<EmModule>;
 
-/* Emscripten ES6 output lives at /fluid.js (in /public). Vite will not
- * bundle it; we import it as a side-effect-free dynamic URL so the WASM
- * is fetched once at runtime. */
+/* Emscripten ES6 output lives at <BASE_URL>/fluid.js (i.e. /public).
+ * Vite will not bundle it; we import it as a side-effect-free dynamic
+ * URL so the WASM is fetched once at runtime. We resolve through
+ * import.meta.env.BASE_URL so the bundle works whether the site is
+ * hosted at "/" or "/some/subpath/". */
 async function loadEmscripten(): Promise<EmModule> {
-  // @ts-expect-error: generated, no .d.ts
-  const mod = await import(/* @vite-ignore */ "/fluid.js");
+  const base = (import.meta as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? "/";
+  const url  = base.replace(/\/$/, "") + "/fluid.js";
+  const mod = await import(/* @vite-ignore */ url);
   const factory: EmFactory = mod.default;
   return factory({});
 }
@@ -64,24 +68,31 @@ export interface FluidConfig {
 export class FluidBridge {
   private mod!: EmModule;
   private sim = 0;
-  /** Reusable RGB buffer (length = (N+2)² × 3). */
-  private rgbBuf!: Float32Array;
+  /** Pointer (byte offset into HEAPU8) of an RGB scratch buffer in WASM
+   * memory that fluid_copy_dye_rgb writes into each frame. */
+  private rgbPtr = 0;
+  /** Number of float entries in the RGB scratch buffer. */
+  private rgbLen = 0;
   private _N = 0;
 
-  /** Pull dye field directly out of WASM memory by calling the per-cell
-   * accessor. Slower than a single memory view but works with `-O3 -flto`
-   * regardless of how Emscripten lays out the FluidSim struct. */
   async init(cfg: FluidConfig): Promise<void> {
     this.mod = await loadEmscripten();
     this.sim = this.mod._fluid_create(cfg.N, cfg.dt, cfg.diff, cfg.visc);
     if (this.sim === 0) throw new Error("fluid_create failed");
     this._N = cfg.N;
-    this.rgbBuf = new Float32Array((cfg.N + 2) * (cfg.N + 2) * 3);
+    /* Allocate the RGB scratch buffer once, inside WASM memory. */
+    this.rgbLen = (cfg.N + 2) * (cfg.N + 2) * 3;
+    this.rgbPtr = this.mod._malloc(this.rgbLen * 4 /* sizeof(float) */);
+    if (this.rgbPtr === 0) throw new Error("malloc for RGB scratch failed");
   }
 
   get N(): number { return this._N; }
 
   destroy(): void {
+    if (this.rgbPtr) {
+      this.mod._free(this.rgbPtr);
+      this.rgbPtr = 0;
+    }
     if (this.sim) {
       this.mod._fluid_destroy(this.sim);
       this.sim = 0;
@@ -115,22 +126,20 @@ export class FluidBridge {
     return this.mod._fluid_get_obstacle(this.sim, x | 0, y | 0) !== 0;
   }
 
-  /** Reads the entire RGB dye field into `rgbBuf` and returns a view of
-   * it. Indexed (i, j) → ((i + (N+2)*j) * 3 + channel). */
+  /** Bulk-copies the entire RGB dye field into a WASM scratch buffer
+   * with one C call, then returns a Float32Array VIEW directly over the
+   * WASM heap (no JS-side copy). The view is invalidated whenever the
+   * WASM heap is resized — callers must not retain it across `step()`.
+   *
+   * Note we recompute the view every frame because ALLOW_MEMORY_GROWTH
+   * may have moved HEAPF32's underlying ArrayBuffer. The cost is a few
+   * Float32Array constructor calls; negligible vs. the per-cell ccall
+   * loop the bridge replaced.
+   */
   readDye(): Float32Array {
-    const N  = this._N;
-    const Nx = N + 2;
-    const buf = this.rgbBuf;
-    const m = this.mod;
-    const sim = this.sim;
-    for (let j = 0; j < Nx; j++) {
-      for (let i = 0; i < Nx; i++) {
-        const idx = (i + Nx * j) * 3;
-        buf[idx]     = m._fluid_get_dye_r(sim, i, j);
-        buf[idx + 1] = m._fluid_get_dye_g(sim, i, j);
-        buf[idx + 2] = m._fluid_get_dye_b(sim, i, j);
-      }
-    }
-    return buf;
+    this.mod._fluid_copy_dye_rgb(this.sim, this.rgbPtr);
+    const f32 = this.mod.HEAPF32;
+    const offsetF32 = this.rgbPtr >>> 2; // byte offset → float32 index
+    return f32.subarray(offsetF32, offsetF32 + this.rgbLen);
   }
 }

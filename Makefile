@@ -26,6 +26,7 @@ WASM_EXPORTS = "['_fluid_create','_fluid_destroy','_fluid_reset','_fluid_step',\
 '_fluid_set_viscosity','_fluid_set_diffusion','_fluid_set_vorticity','_fluid_set_buoyancy','_fluid_set_dt',\
 '_fluid_get_dye_r','_fluid_get_dye_g','_fluid_get_dye_b','_fluid_get_velocity_u','_fluid_get_velocity_v',\
 '_fluid_get_velocity_mag','_fluid_get_vorticity','_fluid_get_obstacle','_fluid_size',\
+'_fluid_copy_dye_rgb',\
 '_malloc','_free']"
 WASM_RUNTIME = "['ccall','cwrap','HEAPU8','HEAPF32','HEAPU32']"
 WASM_FLAGS   = -O3 -flto \
