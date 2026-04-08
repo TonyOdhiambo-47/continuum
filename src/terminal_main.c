@@ -30,30 +30,46 @@
 
 /* ---------- terminal mode plumbing -------------------------------------- */
 
-static struct termios g_orig_tio;
-static int            g_tio_saved = 0;
+static struct termios       g_orig_tio;
+static volatile sig_atomic_t g_tio_saved   = 0;
+static volatile sig_atomic_t g_should_quit = 0;
 
-static void term_restore(void) {
-    if (g_tio_saved) {
-        /* Disable mouse tracking, show cursor, leave alt screen, reset. */
-        const char *cleanup =
-            "\x1b[?1003l"   /* mouse: any-event off */
-            "\x1b[?1006l"   /* mouse: SGR off */
-            "\x1b[?25h"     /* show cursor */
-            "\x1b[0m"       /* reset attributes */
-            "\x1b[?1049l";  /* leave alternate screen */
-        ssize_t _ = write(STDOUT_FILENO, cleanup, strlen(cleanup));
-        (void)_;
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_tio);
-        g_tio_saved = 0;
+/* Loop on partial writes / EINTR. Used both at startup and shutdown so
+ * the terminal protocol is never left half-emitted. */
+static void safe_write(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        if (n == 0) return;
+        p   += (size_t)n;
+        len -= (size_t)n;
     }
 }
 
+static void term_restore(void) {
+    /* Idempotent: signal handler + atexit may both run. */
+    if (!g_tio_saved) return;
+    g_tio_saved = 0;
+
+    static const char cleanup[] =
+        "\x1b[?1003l"   /* mouse: any-event off */
+        "\x1b[?1006l"   /* mouse: SGR off */
+        "\x1b[?25h"     /* show cursor */
+        "\x1b[0m"       /* reset attributes */
+        "\x1b[?1049l";  /* leave alternate screen */
+    safe_write(STDOUT_FILENO, cleanup, sizeof(cleanup) - 1);
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_tio);
+}
+
+/* Signal handler: ONLY set the atomic flag. Cleanup happens in main()
+ * via atexit() once the loop notices and returns. No async-unsafe calls. */
 static void on_signal(int sig) {
-    term_restore();
-    /* Re-raise with default disposition so the parent shell sees it. */
-    signal(sig, SIG_DFL);
-    raise(sig);
+    (void)sig;
+    g_should_quit = 1;
 }
 
 static int term_setup(void) {
@@ -84,25 +100,37 @@ static int term_setup(void) {
     }
 
     /* Enter alt screen, hide cursor, enable any-event SGR mouse mode. */
-    const char *setup =
+    static const char setup[] =
         "\x1b[?1049h"   /* alt screen */
         "\x1b[?25l"     /* hide cursor */
         "\x1b[2J"       /* clear */
         "\x1b[H"        /* home */
         "\x1b[?1003h"   /* any-event mouse */
         "\x1b[?1006h";  /* SGR extended mode */
-    ssize_t _ = write(STDOUT_FILENO, setup, strlen(setup));
-    (void)_;
+    safe_write(STDOUT_FILENO, setup, sizeof(setup) - 1);
     return 0;
 }
 
 /* ---------- terminal size ----------------------------------------------- */
 
+/* Hard ceiling on terminal dimensions we render. Anything bigger is
+ * clamped — both to keep the render buffer bounded and to ensure the
+ * size_t multiplication never wraps. 4096 columns × 4096 rows × 64 bytes
+ * is well under SIZE_MAX on any 64-bit system. */
+#define MAX_TERM_W 4096
+#define MAX_TERM_H 4096
+
 static void term_get_size(int *cols, int *rows) {
     struct winsize ws = {0};
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
-        *cols = ws.ws_col;
-        *rows = ws.ws_row;
+        int c = (int)ws.ws_col;
+        int r = (int)ws.ws_row;
+        if (c < 1) c = 1;
+        if (r < 1) r = 1;
+        if (c > MAX_TERM_W) c = MAX_TERM_W;
+        if (r > MAX_TERM_H) r = MAX_TERM_H;
+        *cols = c;
+        *rows = r;
     } else {
         *cols = 80;
         *rows = 24;
@@ -137,59 +165,91 @@ typedef struct {
     char   key;
 } InputEvent;
 
-/* Read at most one input event from a 1KB buffer of bytes already read.
- * Returns the number of bytes consumed, 0 if nothing parseable yet. */
-static size_t parse_one_event(const char *buf, size_t len, InputEvent *out) {
+/* Hard cap on how many bytes a single CSI / mouse event may span. Beyond
+ * this we treat the leading ESC as garbage and drop it so the parser can
+ * never deadlock on a malformed prefix. */
+#define MAX_CSI_BYTES 64
+/* Cap on digits per numeric SGR field — prevents int overflow from a long
+ * digit run on stdin. */
+#define MAX_DIGITS    6
+
+/* Returns:
+ *   > 0 : number of bytes consumed (event may or may not be filled)
+ *     0 : need more bytes
+ *    -1 : parse error AND we are confident we should drop a byte
+ */
+static int parse_one_event(const char *buf, size_t len, InputEvent *out) {
     out->have_mouse = 0;
     out->have_key   = 0;
     if (len == 0) return 0;
 
     /* SGR mouse: ESC [ < button ; x ; y ; (M|m) */
-    if (len >= 6 && buf[0] == '\x1b' && buf[1] == '[' && buf[2] == '<') {
+    if (buf[0] == '\x1b' && len >= 2 && buf[1] == '[' &&
+        len >= 3 && buf[2] == '<') {
         size_t i = 3;
         int b = 0, x = 0, y = 0;
+        int d;
+
+        d = 0;
         while (i < len && buf[i] >= '0' && buf[i] <= '9') {
+            if (d++ >= MAX_DIGITS) return -1;
             b = b * 10 + (buf[i] - '0'); i++;
         }
-        if (i >= len || buf[i] != ';') return 0;
+        if (i >= len) {
+            if (i >= MAX_CSI_BYTES) return -1;
+            return 0;
+        }
+        if (buf[i] != ';') return -1;
         i++;
+
+        d = 0;
         while (i < len && buf[i] >= '0' && buf[i] <= '9') {
+            if (d++ >= MAX_DIGITS) return -1;
             x = x * 10 + (buf[i] - '0'); i++;
         }
-        if (i >= len || buf[i] != ';') return 0;
+        if (i >= len) { if (i >= MAX_CSI_BYTES) return -1; return 0; }
+        if (buf[i] != ';') return -1;
         i++;
+
+        d = 0;
         while (i < len && buf[i] >= '0' && buf[i] <= '9') {
+            if (d++ >= MAX_DIGITS) return -1;
             y = y * 10 + (buf[i] - '0'); i++;
         }
-        if (i >= len) return 0;
-        if (buf[i] != 'M' && buf[i] != 'm') return 0;
+        if (i >= len) { if (i >= MAX_CSI_BYTES) return -1; return 0; }
+        if (buf[i] != 'M' && buf[i] != 'm') return -1;
+
         out->have_mouse = 1;
         out->button     = b;
         out->mx         = x;
         out->my         = y;
         out->pressed    = (buf[i] == 'M');
-        return i + 1;
+        return (int)(i + 1);
     }
 
-    /* Bare ESC = quit (also discards any other unrecognised CSI). */
+    /* Bare ESC or unknown CSI. */
     if (buf[0] == '\x1b') {
         if (len == 1) {
             out->have_key = 1;
             out->key      = 27;
             return 1;
         }
-        /* Skip a CSI we didn't understand. */
-        if (len >= 2 && buf[1] == '[') {
+        if (buf[1] == '[') {
             size_t i = 2;
-            while (i < len && !((buf[i] >= 'A' && buf[i] <= 'Z') ||
-                                (buf[i] >= 'a' && buf[i] <= 'z') ||
-                                buf[i] == '~')) {
+            size_t scan_max = len < MAX_CSI_BYTES ? len : MAX_CSI_BYTES;
+            while (i < scan_max && !((buf[i] >= 'A' && buf[i] <= 'Z') ||
+                                     (buf[i] >= 'a' && buf[i] <= 'z') ||
+                                     buf[i] == '~')) {
                 i++;
             }
-            if (i < len) return i + 1;
+            if (i < scan_max) return (int)(i + 1);
+            if (i >= MAX_CSI_BYTES) return -1; /* too long, drop */
             return 0;
         }
-        return 1;
+        /* ESC + char (alt-key); just deliver the char. */
+        out->have_key = 1;
+        out->key      = buf[1];
+        return 2;
     }
 
     /* Single char keystroke. */
@@ -317,8 +377,9 @@ int main(int argc, char **argv) {
     int term_w = 80, term_h = 24;
     term_get_size(&term_w, &term_h);
 
-    /* Per-cell render budget: ~50 bytes is plenty for the SGR triples. */
-    size_t buf_cap = (size_t)term_w * (size_t)term_h * 64 + 4096;
+    /* Per-cell render budget: ~50 bytes is plenty for the SGR triples.
+     * Bounded by MAX_TERM_W × MAX_TERM_H so the multiplication is safe. */
+    size_t buf_cap = (size_t)term_w * (size_t)term_h * 64u + 4096u;
     char  *render_buf = (char *)malloc(buf_cap);
     if (!render_buf) {
         fprintf(stderr, "out of memory\n");
@@ -343,19 +404,18 @@ int main(int argc, char **argv) {
     size_t inbuf_len = 0;
 
     int running = 1;
-    while (running) {
+    while (running && !g_should_quit) {
         /* --- Resize check ----------------------------------------- */
         int new_w, new_h;
         term_get_size(&new_w, &new_h);
         if (new_w != term_w || new_h != term_h) {
             term_w = new_w; term_h = new_h;
-            size_t new_cap = (size_t)term_w * (size_t)term_h * 64 + 4096;
+            size_t new_cap = (size_t)term_w * (size_t)term_h * 64u + 4096u;
             if (new_cap > buf_cap) {
                 char *nb = (char *)realloc(render_buf, new_cap);
                 if (nb) { render_buf = nb; buf_cap = new_cap; }
             }
-            ssize_t _ = write(STDOUT_FILENO, "\x1b[2J", 4);
-            (void)_;
+            safe_write(STDOUT_FILENO, "\x1b[2J", 4);
         }
 
         /* --- Read input via select for a short timeout ------------ */
@@ -371,8 +431,15 @@ int main(int argc, char **argv) {
         size_t off = 0;
         while (off < inbuf_len) {
             InputEvent ev;
-            size_t consumed = parse_one_event(inbuf + off, inbuf_len - off, &ev);
-            if (consumed == 0) break;
+            int rc = parse_one_event(inbuf + off, inbuf_len - off, &ev);
+            if (rc == 0) {
+                /* Need more bytes — but if the buffer is already huge and
+                 * still unparseable, drop the head byte to recover. */
+                if (inbuf_len - off >= MAX_CSI_BYTES) { off++; continue; }
+                break;
+            }
+            if (rc < 0) { off++; continue; } /* malformed: drop one byte */
+            size_t consumed = (size_t)rc;
             off += consumed;
 
             if (ev.have_mouse) {
@@ -445,8 +512,7 @@ int main(int argc, char **argv) {
         /* --- Render --------------------------------------------- */
         char *end = render_frame(sim, render_buf, term_w, term_h,
                                  1, fps_disp, current_preset, show_velocity);
-        ssize_t _ = write(STDOUT_FILENO, render_buf, (size_t)(end - render_buf));
-        (void)_;
+        safe_write(STDOUT_FILENO, render_buf, (size_t)(end - render_buf));
 
         /* --- FPS accounting + frame pacing ---------------------- */
         double now = monotonic_seconds();
