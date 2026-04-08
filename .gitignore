@@ -1,0 +1,18 @@
+continuum
+continuum_test
+*.o
+*.obj
+*.wasm
+*.bc
+
+# Web build artefacts
+web/node_modules
+web/dist
+web/public/fluid.js
+web/public/fluid.wasm
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
