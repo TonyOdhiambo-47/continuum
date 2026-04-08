@@ -1,88 +1,82 @@
 # Continuum
 
-A real-time **2D Navier–Stokes fluid simulator** that runs in your terminal **and** your browser. The same C solver powers both: compiled natively for ANSI-truecolor terminal rendering, and compiled to **WebAssembly** for a GPU-accelerated WebGL2 frontend in React.
+A 2D Navier-Stokes fluid simulator that runs in your terminal and in the browser. The same C solver does both jobs: built natively for ANSI truecolor terminal output, and compiled to WebAssembly for a WebGL2 frontend in React.
 
-The C core has zero external dependencies — `stdio.h`, `stdlib.h`, `math.h`, `termios.h`, that's it.
+The C core has no external dependencies. Just `stdio.h`, `stdlib.h`, `math.h`, and `termios.h`.
 
-> Jos Stam's "Stable Fluids" (1999), with vorticity confinement, buoyancy, RGB multi-channel dye, and obstacle boundaries.
+Based on Jos Stam's "Stable Fluids" (1999), with vorticity confinement, buoyancy, RGB dye channels, and obstacle boundaries thrown in.
 
----
-
-## Build & run
+## Build and run
 
 ### Terminal
 
 ```bash
 make terminal       # builds ./continuum
-./continuum         # default 96×96 grid
+./continuum         # default 96x96 grid
 ./continuum 192     # custom resolution
 ```
 
-You'll need a true-color terminal (iTerm2, Alacritty, kitty, modern macOS Terminal, modern Windows Terminal, etc.). The renderer uses Unicode half-blocks (`▀`) so each character cell shows two vertically-stacked pixels.
+You'll need a truecolor terminal (iTerm2, Alacritty, kitty, recent macOS Terminal, recent Windows Terminal). The renderer uses Unicode half-blocks (`▀`) so each character cell shows two stacked pixels.
 
 **Controls**
 
 | Key             | Action                                      |
 |-----------------|---------------------------------------------|
-| **Left-drag**   | Inject dye + force in the drag direction    |
+| **Left-drag**   | Inject dye and force in the drag direction  |
 | **Right-drag**  | Inject force only (invisible push)          |
-| `1`–`4`         | Preset scenarios                            |
+| `1`-`4`         | Preset scenarios                            |
 | `r`             | Reset current preset                        |
 | `v`             | Toggle velocity visualization               |
 | `q` / `Esc`     | Quit                                        |
 
 **Presets**
 
-| Key | Scenario              | What you see                                      |
-|-----|-----------------------|---------------------------------------------------|
-| `1` | Smoke plume           | Rising thermal column with turbulent mixing       |
-| `2` | Ink drop              | Expanding dye burst with vortex ring              |
-| `3` | Von Kármán            | Alternating vortex shedding behind a cylinder     |
-| `4` | Kelvin–Helmholtz      | Rolling instability waves on a shear boundary     |
+| Key | Scenario          | What you see                                  |
+|-----|-------------------|-----------------------------------------------|
+| `1` | Smoke plume       | Rising thermal column with turbulent mixing   |
+| `2` | Ink drop          | Expanding dye burst with a vortex ring        |
+| `3` | Von Kármán        | Alternating vortex shedding behind a cylinder |
+| `4` | Kelvin-Helmholtz  | Rolling instability waves on a shear boundary |
 
 ### Browser
 
 ```bash
-make wasm           # compile C core to WebAssembly (requires emscripten)
+make wasm           # compile C core to WebAssembly (needs emscripten)
 make run-web        # cd web && npm install && npm run dev
 ```
 
 Then open the URL Vite prints (default `http://localhost:5173`).
 
-The browser version runs the same C solver compiled to WASM, with a WebGL2 renderer that does bloom post-processing on top of the dye field. Sliders for viscosity, vorticity confinement, exposure, and bloom let you mess with the physics live. Resolution can be cranked up to 256×256 if your machine has the headroom.
+The browser version runs the same C solver as WASM, with a WebGL2 renderer that adds bloom post-processing on top of the dye field. There are sliders for viscosity, vorticity confinement, exposure, and bloom so you can play with the physics live. Resolution goes up to 256x256 if your machine can handle it.
 
----
-
-## What's under the hood
+## What's inside
 
 ```
 src/fluid.h         API (one big struct, one big calloc)
-src/fluid.c         The solver — Stam stable fluids + extensions
-src/presets.c       Four canonical demo scenarios
-src/terminal_main.c Raw-mode termios + ANSI truecolor half-block renderer
-                    + SGR mouse parsing + main loop
+src/fluid.c         The solver, Stam stable fluids plus extensions
+src/presets.c       Four demo scenarios
+src/terminal_main.c Raw-mode termios, ANSI truecolor half-block renderer,
+                    SGR mouse parsing, main loop
 
 web/                React + TypeScript + Vite + WebGL2 frontend
-web/src/wasm/       FluidBridge.ts — type-safe wrapper around the WASM exports
-web/src/render/     WebGLRenderer + bloom fragment shader
+web/src/wasm/       FluidBridge.ts, type-safe wrapper around the WASM exports
+web/src/render/     WebGLRenderer plus the bloom fragment shader
 ```
 
 The solver runs the standard Stam timestep:
 
-1. Apply buoyancy + vorticity confinement
-2. Diffuse velocity (implicit Gauss–Seidel)
-3. Project — solve the pressure Poisson equation, subtract `∇p`
-4. Advect velocity with itself (semi-Lagrangian backtrace + bilinear interp)
+1. Apply buoyancy and vorticity confinement
+2. Diffuse velocity (implicit Gauss-Seidel)
+3. Project: solve the pressure Poisson equation, subtract `∇p`
+4. Advect velocity with itself (semi-Lagrangian backtrace plus bilinear interp)
 5. Project again
-6. Diffuse + advect dye
+6. Diffuse and advect dye
 
-**Obstacles** are handled with a masked-stencil pressure solve: solid neighbours impose `∂p/∂n = 0` (no-flux), giving the velocity a tangential boundary condition without modifying the rest of the loop.
+**Obstacles** use a masked-stencil pressure solve. Solid neighbours impose `∂p/∂n = 0` (no-flux), which gives the velocity a tangential boundary condition without touching the rest of the loop.
 
-**Vorticity confinement** restores the small-scale curl that numerical diffusion would otherwise eat. The strength is grid-resolution-aware (force is multiplied by `N`) so the same slider value behaves the same at 64×64 and 256×256.
+**Vorticity confinement** puts back the small-scale curl that numerical diffusion eats. The strength scales with grid resolution (force is multiplied by `N`) so the same slider value behaves consistently at 64x64 and 256x256.
 
-**WASM↔JS** uses a single bulk-copy export (`fluid_copy_dye_rgb`) writing into a malloc'd scratch buffer. The TypeScript bridge then exposes that buffer as a `Float32Array.subarray()` view directly over WASM heap — one C call per frame instead of one per cell.
-
----
+**WASM to JS** goes through a single bulk-copy export (`fluid_copy_dye_rgb`) that writes into a malloc'd scratch buffer. The TypeScript bridge exposes that buffer as a `Float32Array.subarray()` view directly over the WASM heap, so it's one C call per frame instead of one per cell.
 
 ## Build matrix
 
@@ -94,16 +88,10 @@ The solver runs the standard Stam timestep:
 | Web app | `make web`        | `web/dist/`                  | Node + Vite      |
 | All     | `make`            | terminal binary              | cc               |
 
----
-
 ## Tech
 
-C11 · WebAssembly (Emscripten) · WebGL2 / GLSL ES 3.00 · React 18 · TypeScript · Vite
-
-No libraries in the C code. Just math.
-
----
+C11, WebAssembly (Emscripten), WebGL2 / GLSL ES 3.00, React 18, TypeScript, Vite.
 
 ## Author
 
-Tony Odhiambo · MIT '28
+Tony Odhiambo, MIT '28
